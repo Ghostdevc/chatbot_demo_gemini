@@ -3,8 +3,16 @@ import requests
 import os
 import io
 
-# FastAPI backend'inizin çalıştığı URL
-BASE_URL = "http://127.0.0.1:8000"
+# Streamlit secrets'tan BASE_URL'i çekiyoruz.
+# Eğer yerel makinede çalışıyorsa ve st.secrets mevcut değilse,
+# veya BASE_URL secret'ı tanımlı değilse varsayılan olarak lokal adresi kullanır.
+# Canlıda ise st.secrets'tan doğru URL'yi alacaktır.
+try:
+    BASE_URL = st.secrets["BASE_URL"]
+except (KeyError, AttributeError):
+    # Bu blok sadece yerel geliştirme sırasında veya secret tanımlı olmadığında çalışır
+    # Canlı ortamda st.secrets["BASE_URL"] her zaman mevcut olmalı
+    BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 # --- Uygulama Başlığı ve Başlangıç Ayarları ---
 st.set_page_config(page_title="AI Chatbot Personalarım", layout="wide")

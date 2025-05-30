@@ -15,7 +15,7 @@ if not BASE_URL: # Eğer env. değişkeni tanımlı değilse, yerel varsayılan�
 
 # --- Uygulama Başlığı ve Başlangıç Ayarları ---
 st.set_page_config(page_title="AI Chatbot Personalarım", layout="wide")
-st.title("🤖 AI Chatbot Personalarım")
+st.title("🤖 AI Chatbotlarım")
 
 # Session state'i başlat veya mevcutsa kullan
 if "current_chatbot_id" not in st.session_state:

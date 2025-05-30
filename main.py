@@ -2,7 +2,7 @@
 import os
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, Response, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
@@ -198,6 +198,12 @@ class ChatbotResponse(BaseModel):
     boundary_text: str | None = None
 
 
+class UpdateChatbotRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    boundary_text: str | None = None
+
+
 # --- FastAPI Uç Noktaları (Endpoints) ---
 @app.post("/chatbots/{chatbot_id}/upload_document/")
 async def upload_document_to_chatbot(chatbot_id: int, file: UploadFile = File(...)):
@@ -309,6 +315,221 @@ async def upload_document_to_chatbot(chatbot_id: int, file: UploadFile = File(..
         conn.close()
         if os.path.exists(file_location):
             os.remove(file_location)
+
+
+@app.put("/chatbots/{chatbot_id}", response_model=ChatbotResponse)
+async def update_chatbot(chatbot_id: int, request: UpdateChatbotRequest):
+    """Belirli bir chatbot'u günceller."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Önce chatbot'un varlığını kontrol et
+        cursor.execute("SELECT name, description, boundary_text FROM chatbots WHERE id = %s;", (chatbot_id,))
+        existing_chatbot = cursor.fetchone()
+        if not existing_chatbot:
+            raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı.")
+
+        updates = []
+        params = []
+
+        if request.name is not None:
+            updates.append("name = %s")
+            params.append(request.name)
+        if request.description is not None:
+            updates.append("description = %s")
+            params.append(request.description)
+        if request.boundary_text is not None:
+            updates.append("boundary_text = %s")
+            params.append(request.boundary_text)
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="Güncellenecek veri sağlanmadı.")
+
+        params.append(chatbot_id) # WHERE koşulu için chatbot_id'yi en sona ekle
+
+        query = f"UPDATE chatbots SET {', '.join(updates)} WHERE id = %s RETURNING id, name, description, boundary_text;"
+        cursor.execute(query, params)
+        updated_data = cursor.fetchone()
+
+        if updated_data:
+            conn.commit()
+            return ChatbotResponse(
+                id=updated_data[0],
+                name=updated_data[1],
+                description=updated_data[2],
+                boundary_text=updated_data[3]
+            )
+        else:
+            raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı veya güncellenemedi.")
+
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Bu isimde bir chatbot zaten mevcut.")
+    except Exception as e:
+        conn.rollback()
+        print(f"Chatbot güncelleme hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Chatbot güncellenirken bir hata oluştu: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.delete("/chatbots/{chatbot_id}", status_code=204) # 204 No Content for successful deletion
+async def delete_chatbot(chatbot_id: int):
+    """Belirli bir chatbot'u ve ilişkili tüm dokümanlarını siler."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Önce chatbot'un varlığını kontrol et
+        cursor.execute("SELECT COUNT(*) FROM chatbots WHERE id = %s;", (chatbot_id,))
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı.")
+
+        # `ON DELETE CASCADE` sayesinde `chatbot_documents` tablosundaki ilgili girişler otomatik silinecektir.
+        # Ancak, `documents` tablosundaki orijinal doküman parçaları silinmez.
+        # Eğer bir doküman birden fazla chatbota bağlıysa, sadece o chatbot'a ait bağlantı silinir.
+        # Eğer bir doküman sadece bu chatbota bağlıysa ve onu tamamen silmek istiyorsanız, daha karmaşık bir mantık gerekir.
+        # Şimdilik, sadece chatbot_documents bağlantısını ve chatbot'u silmek yeterlidir.
+
+        # Chatbot'u sil
+        cursor.execute("DELETE FROM chatbots WHERE id = %s RETURNING id;", (chatbot_id,))
+        deleted_id = cursor.fetchone()
+
+        if not deleted_id:
+            raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı veya silinemedi.")
+
+        conn.commit()
+
+        # İlişkili FAISS indeks dosyasını diskten sil
+        chatbot_faiss_path = os.path.join(FAISS_INDEX_DIR, f"faiss_index_{chatbot_id}.bin")
+        if os.path.exists(chatbot_faiss_path):
+            os.remove(chatbot_faiss_path)
+            print(f"Chatbot ID {chatbot_id} için FAISS indeksi dosyası silindi.")
+
+        return Response(status_code=204) # 204 No Content
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Chatbot silme hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Chatbot silinirken bir hata oluştu: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Chatbot'a yüklenen belirli bir dokümanı kaldırma endpoint'i (İsteğe Bağlı ama İyi olur)
+@app.delete("/chatbots/{chatbot_id}/documents/{document_id}", status_code=204)
+async def remove_document_from_chatbot(chatbot_id: int, document_id: int):
+    """Belirli bir dokümanı belirli bir chatbota bağlantısından kaldırır."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Chatbot ve doküman bağlantısının varlığını kontrol et
+        cursor.execute(
+            "SELECT COUNT(*) FROM chatbot_documents WHERE chatbot_id = %s AND document_id = %s;",
+            (chatbot_id, document_id)
+        )
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail="Belirtilen chatbot ve doküman bağlantısı bulunamadı.")
+
+        # chatbot_documents tablosundaki bağlantıyı sil
+        cursor.execute(
+            "DELETE FROM chatbot_documents WHERE chatbot_id = %s AND document_id = %s;",
+            (chatbot_id, document_id)
+        )
+        conn.commit()
+
+        # FAISS indeksini yeniden oluştur (veya güncelleyip kaydet)
+        # Bu kısım karmaşıklaşabilir, çünkü bir dokümanı FAISS'ten tam olarak kaldırmak zordur.
+        # En basit yol, FAISS indeksini tamamen yeniden oluşturmaktır (dokümanları DB'den çekerek).
+        # Büyük indeksler için performans sorunu yaratabilir.
+        # Daha verimli bir yöntem, FAISS'te "soft delete" veya "rebuild on demand" uygulamaktır.
+        # Şimdilik, sadece FAISS indeksini yenilemiyoruz, çünkü bir sonraki yüklemede veya
+        # yeni doküman eklemede indeks otomatik güncellenecektir.
+        # Veya basitçe tüm dokümanları çekip yeniden indeksleyebiliriz (büyük verilerde sorun).
+        # Daha iyi bir yaklaşım: İndeksi yeniden oluşturmak için bir yardımcı fonksiyon yazmak.
+        
+        # Basit bir yeniden oluşturma örneği (performans açısından sorunlu olabilir):
+        # documents_for_reindexing = []
+        # cursor.execute("""
+        #     SELECT d.page_number, d.content, cd.original_filename, cd.chatbot_id, d.id as doc_id
+        #     FROM documents d
+        #     JOIN chatbot_documents cd ON d.id = cd.document_id
+        #     WHERE cd.chatbot_id = %s;
+        # """, (chatbot_id,))
+        # for page_num, content, filename, cb_id, d_id in cursor.fetchall():
+        #     new_doc = Document(page_content=content, metadata={"page": page_num, "original_filename": filename, "chatbot_id": cb_id, "doc_id": d_id})
+        #     documents_for_reindexing.append(new_doc)
+        
+        # faiss_base_index = faiss.IndexFlatL2(GEMINI_EMBEDDING_DIM)
+        # current_faiss_index = FAISS(
+        #     embedding_function=embeddings.embed_query,
+        #     index=faiss_base_index,
+        #     docstore=InMemoryDocstore(),
+        #     index_to_docstore_id={}
+        # )
+        # if documents_for_reindexing:
+        #     current_faiss_index.add_documents(documents_for_reindexing)
+        # save_faiss_index(current_faiss_index, chatbot_id)
+        # print(f"Chatbot ID {chatbot_id} için FAISS indeksi yeniden oluşturuldu.")
+
+
+        return Response(status_code=204)
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Doküman kaldırma hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Doküman kaldırılırken bir hata oluştu: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Bir chatbota ait tüm dokümanları listeleme endpoint'i (Frontend için faydalı)
+@app.get("/chatbots/{chatbot_id}/documents/", response_model=List[dict])
+async def list_chatbot_documents(chatbot_id: int):
+    """Belirli bir chatbota ait tüm dokümanları listeler."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Chatbot'un varlığını kontrol et
+        cursor.execute("SELECT COUNT(*) FROM chatbots WHERE id = %s;", (chatbot_id,))
+        if cursor.fetchone()[0] == 0:
+            raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı.")
+
+        cursor.execute("""
+            SELECT cd.document_id, cd.original_filename, d.page_number
+            FROM chatbot_documents cd
+            JOIN documents d ON cd.document_id = d.id
+            WHERE cd.chatbot_id = %s
+            GROUP BY cd.document_id, cd.original_filename, d.page_number
+            ORDER BY cd.original_filename, d.page_number;
+        """, (chatbot_id,))
+        
+        documents_data = {}
+        for doc_id, filename, page_number in cursor.fetchall():
+            if filename not in documents_data:
+                documents_data[filename] = {
+                    "filename": filename,
+                    "document_ids": [],
+                    "pages": []
+                }
+            documents_data[filename]["document_ids"].append(doc_id)
+            documents_data[filename]["pages"].append(page_number)
+        
+        # Liste haline getir
+        response_list = [
+            {"filename": k, "document_ids": list(set(v["document_ids"])), "pages": sorted(list(set(v["pages"])))}
+            for k, v in documents_data.items()
+        ]
+        
+        return response_list
+
+    except Exception as e:
+        print(f"Chatbot dokümanlarını listeleme hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Chatbot dokümanları listelenirken bir hata oluştu: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 
 class ChatRequest(BaseModel):
     query: str

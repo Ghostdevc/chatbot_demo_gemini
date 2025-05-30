@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-dotenv
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-google-genai # Google Gemini desteği için eklendi
+pypdf
+psycopg2-binary
+faiss-cpu # CPU versiyonu, GPU kullanmıyorsanız bu yeterli
+streamlit
+requests
+python-multipart
+python-docx # Word belgeleri (.docx) için
+unstructured # Geniş dosya türleri desteği için (isteğe bağlı ama güçlü)
+ebooklib # EPUB dosyaları için (isteğe bağlı)

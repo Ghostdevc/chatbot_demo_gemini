@@ -3,7 +3,12 @@ import requests
 import os
 import io
 
-BASE_URL="http://127.0.0.1:8000"
+try:
+    BASE_URL = st.secrets["BASE_URL"]
+except (KeyError, AttributeError):
+    # Bu blok sadece yerel geliştirme sırasında veya secret tanımlı olmadığında çalışır
+    # Canlı ortamda st.secrets["BASE_URL"] her zaman mevcut olmalı
+    BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 # --- Uygulama Başlığı ve Başlangıç Ayarları ---
 st.set_page_config(page_title="AI Chatbot Personalarım", layout="wide")

@@ -23,6 +23,15 @@ from langchain_community.vectorstores.faiss import FAISS
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 
+from langchain.prompts import PromptTemplate # Eğer PromptTemplate kullanıyorsanız
+
+from langchain.memory import ConversationBufferWindowMemory # Önceki N mesajı tutmak için
+from langchain.chains import ConversationalRetrievalChain
+from langchain.schema import HumanMessage, AIMessage # Sohbet geçmişini temsil etmek için
+from typing import List, Dict, Any # Tip belirtmeleri için
+
+
+
 import psycopg2
 import pickle
 import faiss # FAISS kütüphanesini doğrudan kullanmak için
@@ -64,6 +73,46 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail="Veritabanı bağlantı hatası.")
 
 
+def load_chat_history_from_db(chatbot_id: int) -> List[Dict[str, str]]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT sender, message FROM chat_messages WHERE chatbot_id = %s ORDER BY timestamp ASC;",
+            (chatbot_id,)
+        )
+        history_rows = cursor.fetchall()
+
+        chat_history = []
+        for sender, message in history_rows:
+            if sender == 'user':
+                chat_history.append(HumanMessage(content=message))
+            elif sender == 'bot':
+                chat_history.append(AIMessage(content=message))
+        return chat_history
+    except Exception as e:
+        print(f"Error loading chat history from DB: {e}")
+        return [] # Hata durumunda boş liste döndür
+    finally:
+        cursor.close()
+        conn.close()
+
+def save_chat_message_to_db(chatbot_id: int, sender: str, message: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO chat_messages (chatbot_id, sender, message) VALUES (%s, %s, %s);",
+            (chatbot_id, sender, message)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving chat message to DB: {e}")
+        conn.rollback()
+    finally:
+        cursor.close()
+        conn.close()
+
 
 def create_tables():
     """Gerekirse PostgreSQL tablolarını oluşturur."""
@@ -72,7 +121,7 @@ def create_tables():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # `documents` tablosu (mevcut hali, küçük bir değişiklik: filename artık zorunlu değil çünkü chatbot_documents ile ilişkilenecek)
+        # `documents` tablosu
         cur.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 id SERIAL PRIMARY KEY,
@@ -81,7 +130,7 @@ def create_tables():
             );
         """)
 
-        # Yeni `chatbots` tablosu
+        # `chatbots` tablosu
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chatbots (
                 id SERIAL PRIMARY KEY,
@@ -91,19 +140,29 @@ def create_tables():
             );
         """)
 
-        # Yeni `chatbot_documents` ara tablosu (Many-to-Many ilişkisi için)
-        # Bir chatbot'un birden fazla dokümanı, bir dokümanın birden fazla chatbot'u olabilir.
+        # `chatbot_documents` ara tablosu
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chatbot_documents (
                 chatbot_id INTEGER NOT NULL REFERENCES chatbots(id) ON DELETE CASCADE,
                 document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                original_filename VARCHAR(255) NOT NULL, -- Dokümanın orijinal adı burada tutulacak
+                original_filename VARCHAR(255) NOT NULL,
                 PRIMARY KEY (chatbot_id, document_id)
             );
         """)
 
+        # Yeni `chat_messages` tablosu
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                chatbot_id INTEGER NOT NULL REFERENCES chatbots(id) ON DELETE CASCADE,
+                sender VARCHAR(50) NOT NULL, -- 'user' veya 'bot'
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         conn.commit()
-        print("`documents`, `chatbots` ve `chatbot_documents` tabloları başarıyla kontrol edildi/oluşturuldu.")
+        print("`documents`, `chatbots`, `chatbot_documents` ve `chat_messages` tabloları başarıyla kontrol edildi/oluşturuldu.")
     except Exception as e:
         print(f"Tablo oluşturma hatası: {e}")
         raise HTTPException(status_code=500, detail="Veritabanı tablo oluşturma hatası.")
@@ -538,73 +597,108 @@ class ChatRequest(BaseModel):
 async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
     """
     Belirli bir chatbot'a göre kullanıcı sorularını yanıtlar.
+    Konuşma geçmişini yönetir.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # Chatbot bilgilerini al (özellikle boundary_text için)
         cursor.execute("SELECT name, boundary_text FROM chatbots WHERE id = %s;", (chatbot_id,))
         chatbot_data = cursor.fetchone()
         if not chatbot_data:
             raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} bulunamadı.")
         chatbot_name, boundary_text = chatbot_data
 
-        # Chatbot'a ait FAISS indeksini yükle
         current_faiss_index = load_or_create_faiss_index(chatbot_id)
 
-        # FAISS indeksi boşsa veya içinde hiç vektör yoksa hata döndür
         if current_faiss_index is None or (hasattr(current_faiss_index.index, 'ntotal') and current_faiss_index.index.ntotal == 0):
-            raise HTTPException(status_code=404, detail=f"'{chatbot_name}' chatbot'u için henüz yüklü bir belge bulunmamaktadır. Lütfen önce belge yükleyin.")
+            raise HTTPException(status_code=404, detail=f"'{chatbot_name}' için henüz taranmış bir belge bulunmuyor. Lütfen önce belge ekleyin.")
 
-        # Kullanıcının sorusuna en yakın ilgili belge parçalarını FAISS'ten al
-        docs = current_faiss_index.similarity_search(request.query, k=4)
+        # Sohbet geçmişini veritabanından yükle
+        loaded_chat_history_messages = load_chat_history_from_db(chatbot_id)
 
-        # ChatGoogleGenerativeAI modelini kullan
+        # LangChain belleği oluştur (son N mesajı tutmak için)
+        # Burada pencere boyutu 5 olarak ayarlanmıştır, yani son 5 soru-cevap çifti hatırlanır.
+        # Bunu ihtiyacınıza göre artırıp azaltabilirsiniz. Daha büyük pencere, daha fazla token maliyeti demek.
+        memory = ConversationBufferWindowMemory(
+            memory_key="chat_history", 
+            return_messages=True, 
+            output_key='answer',
+            k=5 # Son 5 etkileşimi (soru-cevap çifti) hatırla
+        )
+        # Yüklenen geçmişi belleğe ekle
+        for msg in loaded_chat_history_messages:
+            if isinstance(msg, HumanMessage):
+                memory.chat_memory.add_user_message(msg.content)
+            elif isinstance(msg, AIMessage):
+                memory.chat_memory.add_ai_message(msg.content)
+
+        # LLM modelini kullan (model adını kendi listenizdeki çalışan bir modelle güncellediğinizden emin olun)
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-preview-05-20", temperature=0.7, google_api_key=GOOGLE_API_KEY)
 
-        # Sorguya cevap vermek için context oluştur
-        context_docs = [doc.page_content for doc in docs]
-        context = "\n\n".join(context_docs)
+        # Prompt metnini burada tanımlıyoruz
+        PROMPT_WITH_HISTORY_TEMPLATE = f"""
+            Sen, '{chatbot_name}' adlı bir yapay zeka asistanısın. Kullanıcılarla doğal, arkadaş canlısı ve yardımcı bir tonda sohbet ediyorsun. Sana sunulan tüm bilgiyi, sanki senin kendi doğal bilginmiş gibi doğrudan ifade et; asla bir "kaynak", "belge", "bilgi" veya "sağlanan veri"ye atıfta bulunma.
 
-        # Prompt'a boundary_text'i ekle
-        prompt = f"""
-        Sen, '{chatbot_name}' adlı bir yapay zeka asistanısın. Kullanıcılarla doğal, arkadaş canlısı ve yardımcı bir tonda sohbet ediyorsun. **Sana sunulan tüm bilgiyi, sanki senin kendi doğal bilginmiş gibi doğrudan ifade et; asla bir "kaynak", "belge", "bilgi" veya "sağlanan veri"ye atıfta bulunma.**
+            Amacın, öncelikle sana sunulan bilgilerle ilgili soruları yanıtlamak. Ancak, eğer soru doğrudan bu bilgilerle ilgili değilse veya genel bir selamlama/kibarlık ifadesiyse, genel bilginle uygun ve dostça bir yanıt ver.
 
-        Amacın, öncelikle sana sunulan bilgilerle ilgili soruları yanıtlamak. Ancak, eğer soru doğrudan bu bilgilerle ilgili değilse veya genel bir selamlama/kibarlık ifadesiyse, genel bilginle uygun ve dostça bir yanıt ver.
+            Sorulara yanıt verirken, sadece sana verilen bilgilerle yetin. Eğer bir soruya verilen bilgiler arasında yanıt bulunmuyorsa, bu konuda bilgiye sahip olmadığını veya yardımcı olamayacağını açıkça ve nazikçe ifade et. Ardından, kullanıcıya istersen farklı bir soru sorabileceğini veya başka bir konuda yardımcı olabileceğini kibarca belirt. Asla yanlış veya uydurma bilgi verme.
 
-        Sorulara yanıt verirken, **sadece sana verilen bilgilerle yetin.** Eğer bir soruya verilen bilgiler arasında yanıt bulunmuyorsa, **bu konuda bilgiye sahip olmadığını veya yardımcı olamayacağını açıkça ve nazikçe ifade et.** Ardından, kullanıcıya istersen farklı bir soru sorabileceğini veya başka bir konuda yardımcı olabileceğini kibarca belirt. Asla yanlış veya uydurma bilgi verme.
+            Sohbete insan gibi bir başlangıç yapabilir veya genel sorulara (merhaba, nasılsın gibi) uygun bir karşılık verebilirsin. Cevapların kısa ve öz olabilir, ancak doğal bir dil kullan.
 
-        Sohbete insan gibi bir başlangıç yapabilir veya genel sorulara (merhaba, nasılsın gibi) uygun bir karşılık verebilirsin. Cevapların kısa ve öz olabilir, ancak doğal bir dil kullan.
+            **KESİNLİKLE UYMAN GEREKEN KURALLAR:**
+            - Cevaplarını kibar, saygılı ve yardımsever bir tonda tut.
+            - Sana sunulan bilgileri, kendi bilginmiş gibi doğal bir dille sun.
+            - **Asla "belgelerde", "kaynaklarda", "bağlamda", "elimizde", "bana sağlanan bilgilerde", "bilgilere göre", "anladığım kadarıyla", "belirtiliyor" gibi ifadelere yer verme.** Bu kelimeleri veya benzer anlamdaki kelimeleri kullanmaktan kaçın.
+            - Eğer sana verilen bilgiler dışı genel bir soru gelirse, genel bilgiyle cevapla.
+            - Eğer soru uygunsuz veya alakasız ise, konuya uygun bir şekilde geri çevir.
+            - Kişisel bilgi isteme veya verme.
 
-        **KESİNLİKLE UYMAN GEREKEN KURALLAR:**
-        - Cevaplarını kibar, saygılı ve yardımsever bir tonda tut.
-        - Sana sunulan bilgileri, kendi bilginmiş gibi doğal bir dille sun.
-        - **Asla "belgelerde", "kaynaklarda", "bağlamda", "elimizde", "bana sağlanan bilgilerde", "bilgilere göre", "anladığım kadarıyla", "belirtiliyor" gibi ifadelere yer verme.** Bu kelimeleri veya benzer anlamdaki kelimeleri kullanmaktan kaçın.
-        - Eğer sana verilen bilgiler dışı genel bir soru gelirse, genel bilgiyle cevapla.
-        - Eğer soru uygunsuz veya alakasız ise, konuya uygun bir şekilde geri çevir.
-        - Kişisel bilgi isteme veya verme.
+            {boundary_text if boundary_text else ""}
 
-        {boundary_text if boundary_text else ""}
+            Sohbet geçmişi (önceki konuşmalar):
+            {{chat_history}}
 
-        İşte kullanabileceğin bilgiler:
-        <documents>
-        {context}
-        </documents>
+            İşte kullanabileceğin bilgiler:
+            <documents>
+            {{context}}
+            </documents>
 
-        Kullanıcının sorusu: {request.query}
+            Kullanıcının sorusu: {{question}}
 
-        Yanıtın:
-        """
+            Yanıtın:
+            """
+            
+        # prompt_template nesnesini oluştur
+        prompt_template = PromptTemplate(
+            template=PROMPT_WITH_HISTORY_TEMPLATE,
+            input_variables=["chat_history", "context", "question"]
+        )
 
-        response = llm.predict(prompt) # Gemini modelinden cevabı al
+        # ConversationalRetrievalChain oluştur
+        # Bu zincir hem retriever'ı (FAISS) hem de belleği (chat history) kullanır
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=current_faiss_index.as_retriever(),
+            memory=memory,
+            combine_docs_chain_kwargs={"prompt": prompt_template}, # Yeni prompt template'imizi buraya veriyoruz
+            return_source_documents=False # Kaynak dokümanları döndürmeyelim şimdilik
+        )
+
+        # Chain'i çalıştır ve yanıtı al
+        response = qa_chain.invoke({"question": request.query})
+        answer = response["answer"]
+
+        # Sohbet geçmişini veritabanına kaydet (kullanıcı sorusu ve bot cevabı)
+        save_chat_message_to_db(chatbot_id, "user", request.query)
+        save_chat_message_to_db(chatbot_id, "bot", answer)
 
         return JSONResponse(
             status_code=200,
-            content={"answer": response}
+            content={"answer": answer}
         )
 
     except HTTPException as e:
-        raise e # FastAPI HTTPException'ı doğrudan yükselt
+        raise e
     except Exception as e:
         print(f"Chatbot sohbet hatası: {e}")
         raise HTTPException(status_code=500, detail=f"Soru işlenirken bir hata oluştu: {e}")
@@ -614,6 +708,40 @@ async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
     
 
 # --- Yeni Chatbot Yönetim Endpoints'leri ---
+
+@app.get("/chatbots/{chatbot_id}/history/")
+async def get_chatbot_history(chatbot_id: int):
+    """
+    Belirli bir chatbot'un sohbet geçmişini döndürür.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT sender, message, timestamp FROM chat_messages WHERE chatbot_id = %s ORDER BY timestamp ASC;",
+            (chatbot_id,)
+        )
+        history_rows = cursor.fetchall()
+        
+        history_list = []
+        for sender, message, timestamp in history_rows:
+            history_list.append({
+                "sender": sender,
+                "message": message,
+                "timestamp": timestamp.isoformat() # Zaman damgasını ISO formatında döndür
+            })
+        
+        return JSONResponse(
+            status_code=200,
+            content={"history": history_list}
+        )
+    except Exception as e:
+        print(f"Chat history retrieval error: {e}")
+        raise HTTPException(status_code=500, detail=f"Sohbet geçmişi alınırken bir hata oluştu: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
 
 @app.post("/chatbots/", response_model=ChatbotResponse)
 async def create_chatbot(request: CreateChatbotRequest):

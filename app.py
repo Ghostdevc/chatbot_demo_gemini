@@ -2,13 +2,16 @@ import streamlit as st
 import requests
 import os
 import io
+import json # JSON işlemleri için
 
-try:
-    BASE_URL = st.secrets["BASE_URL"]
-except (KeyError, AttributeError):
-    # Bu blok sadece yerel geliştirme sırasında veya secret tanımlı olmadığında çalışır
-    # Canlı ortamda st.secrets["BASE_URL"] her zaman mevcut olmalı
-    BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+# BASE_URL'i env. değişkeninden veya varsayılan bir değerle al
+# Bu, hem yerel hem de Render'daki backend için geçerli olacaktır.
+# Streamlit Cloud'da 'BASE_URL' secret olarak tanımlanmalıdır.
+BASE_URL = os.getenv("BASE_URL") # Örneğin Render'da veya yerelde bir ENV olarak tanımlanmalı
+if not BASE_URL: # Eğer env. değişkeni tanımlı değilse, yerel varsayılanı kullan
+    BASE_URL = "http://127.0.0.1:8000" 
+    st.warning(f"BASE_URL ortam değişkeni bulunamadı. Varsayılan olarak '{BASE_URL}' kullanılıyor.")
+
 
 # --- Uygulama Başlığı ve Başlangıç Ayarları ---
 st.set_page_config(page_title="AI Chatbot Personalarım", layout="wide")
@@ -19,8 +22,10 @@ if "current_chatbot_id" not in st.session_state:
     st.session_state.current_chatbot_id = None
 if "current_chatbot_name" not in st.session_state:
     st.session_state.current_chatbot_name = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = {} # Her chatbot için ayrı sohbet geçmişi
+# chat_history_from_backend'i doğrudan burada başlatmayalım, 
+# çünkü her zaman backend'den çekilecek.
+# if "chat_history" not in st.session_state:
+#     st.session_state.chat_history = {} # Her chatbot için ayrı sohbet geçmişi
 if "chatbots" not in st.session_state:
     st.session_state.chatbots = [] # Tüm chatbotların listesi
 if "show_create_bot_form" not in st.session_state:
@@ -35,7 +40,7 @@ if "show_edit_bot_form" not in st.session_state:
 def fetch_chatbots():
     """Backend'den chatbot listesini çeker."""
     try:
-        response = requests.get(f"{BASE_URL}/chatbots/")
+        response = requests.get(f"{BASE_URL}/chatbots/") # <-- Düzeltme: BASE_URL kullanıldı
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -50,13 +55,13 @@ def create_new_bot_form():
         name = st.text_input("Chatbot Adı", help="Chatbot'unuz için benzersiz bir ad.")
         description = st.text_area("Açıklama (İsteğe Bağlı)", help="Chatbot'un ne hakkında olduğu hakkında kısa bir açıklama.")
         boundary_text = st.text_area("Boundary Metinleri (İsteğe Bağlı)", 
-                                       help="Chatbot'un davranışını ve odak alanını sınırlayan yönergeler. Örneğin: 'Sadece hukuk metinlerinden cevap ver.'",
-                                       height=150)
+                                         help="Chatbot'un davranışını ve odak alanını sınırlayan yönergeler. Örneğin: 'Sadece hukuk metinlerinden cevap ver.'",
+                                         height=150)
         
         uploaded_files = st.file_uploader("Bu Chatbot için Dokümanları Yükle", 
-                                           type=["pdf", "txt", "docx"], 
-                                           accept_multiple_files=True,
-                                           help="Bu chatbot'un bilgi tabanını oluşturacak belgeler (PDF, TXT, DOCX vb.).")
+                                             type=["pdf", "txt", "docx"], 
+                                             accept_multiple_files=True,
+                                             help="Bu chatbot'un bilgi tabanını oluşturacak belgeler (PDF, TXT, DOCX vb.).")
         
         # BUTONLARIN OLDUĞU KISIM BURASI
         col_submit, col_cancel = st.columns([1, 4]) # Butonlar için sütunlar oluştur
@@ -66,13 +71,11 @@ def create_new_bot_form():
             cancelled = st.form_submit_button("İptal", type="secondary") # İptal butonu eklendi
 
         if submitted:
-            # ... (Mevcut chatbot oluşturma mantığı) ...
             if not name:
                 st.error("Chatbot adı boş bırakılamaz.")
             else:
                 try:
-                    # ... (API çağrısı ve dosya yükleme) ...
-                    create_response = requests.post(f"{BASE_URL}/chatbots/", json={
+                    create_response = requests.post(f"{BASE_URL}/chatbots/", json={ # <-- Düzeltme: BASE_URL kullanıldı
                         "name": name,
                         "description": description,
                         "boundary_text": boundary_text
@@ -88,7 +91,7 @@ def create_new_bot_form():
                             try:
                                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
                                 upload_response = requests.post(
-                                    f"{BASE_URL}/chatbots/{chatbot_id}/upload_document/", 
+                                    f"{BASE_URL}/chatbots/{chatbot_id}/upload_document/", # <-- Düzeltme: BASE_URL kullanıldı
                                     files=files
                                 )
                                 upload_response.raise_for_status()
@@ -130,7 +133,7 @@ def edit_existing_bot_form():
 
     # Chatbot'un mevcut bilgilerini backend'den çek
     try:
-        response = requests.get(f"{BASE_URL}/chatbots/")
+        response = requests.get(f"{BASE_URL}/chatbots/") # <-- Düzeltme: BASE_URL kullanıldı
         response.raise_for_status()
         all_chatbots = response.json()
         current_bot = next((bot for bot in all_chatbots if bot['id'] == chatbot_id), None)
@@ -151,9 +154,9 @@ def edit_existing_bot_form():
         new_name = st.text_input("Chatbot Adı", value=current_bot['name'], help="Chatbot'un yeni adı.")
         new_description = st.text_area("Açıklama (İsteğe Bağlı)", value=current_bot['description'], help="Chatbot hakkında yeni açıklama.")
         new_boundary_text = st.text_area("Boundary Metinleri (İsteğe Bağlı)", 
-                                           value=current_bot['boundary_text'],
-                                           help="Chatbot'un davranışını ve odak alanını sınırlayan yeni yönergeler.",
-                                           height=150)
+                                             value=current_bot['boundary_text'],
+                                             help="Chatbot'un davranışını ve odak alanını sınırlayan yeni yönergeler.",
+                                             height=150)
         
         col_submit, col_cancel = st.columns([1, 4])
         with col_submit:
@@ -171,7 +174,7 @@ def edit_existing_bot_form():
                         "description": new_description,
                         "boundary_text": new_boundary_text
                     }
-                    update_response = requests.put(f"{BASE_URL}/chatbots/{chatbot_id}", json=update_bot_data)
+                    update_response = requests.put(f"{BASE_URL}/chatbots/{chatbot_id}", json=update_bot_data) # <-- Düzeltme: BASE_URL kullanıldı
                     update_response.raise_for_status()
                     st.success(f"'{new_name}' adlı chatbot başarıyla güncellendi!")
                     st.cache_data.clear() # Önbelleği temizle
@@ -245,7 +248,7 @@ def display_chatbot_list():
                              st.session_state.current_chatbot_name = None
                              
                         try:
-                            delete_response = requests.delete(f"{BASE_URL}/chatbots/{bot['id']}")
+                            delete_response = requests.delete(f"{BASE_URL}/chatbots/{bot['id']}") # <-- Düzeltme: BASE_URL kullanıldı
                             delete_response.raise_for_status()
                             st.success(f"'{bot['name']}' adlı chatbot başarıyla silindi.")
                             st.cache_data.clear() # Önbelleği temizle
@@ -255,40 +258,73 @@ def display_chatbot_list():
 
 
 # --- Sohbet Ekranı ---
-def display_chat_interface():
+def display_chatbot_chat_interface():
     """Seçilen chatbot ile sohbet arayüzünü gösterir."""
     chatbot_id = st.session_state.current_chatbot_id
     chatbot_name = st.session_state.current_chatbot_name
 
-    st.subheader(f"💬 '{chatbot_name}' ile Sohbet")
-    st.button("↩️ Chatbot Listesine Dön", on_click=reset_chat_selection)
+    st.subheader(f"Chatbot: {chatbot_name}")
 
-    # Sohbet geçmişini al veya başlat
-    if chatbot_id not in st.session_state.chat_history:
-        st.session_state.chat_history[chatbot_id] = []
+    # Geri dön butonu
+    if st.button("← Chatbot Listesine Geri Dön"):
+        st.session_state.current_chatbot_id = None
+        st.session_state.current_chatbot_name = None
+        # Sohbet geçmişini silmek için st.session_state.chat_history_from_backend = [] yapın
+        # Bu, farklı bir chatbota geçildiğinde eski geçmişin görünmemesini sağlar.
+        if "chat_history_from_backend" in st.session_state:
+            del st.session_state.chat_history_from_backend
+        st.rerun()
 
-    for message in st.session_state.chat_history[chatbot_id]:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    st.markdown("---")
 
-    # Kullanıcıdan mesaj al
-    if prompt := st.chat_input("Bir mesaj yazın..."):
-        st.session_state.chat_history[chatbot_id].append({"role": "user", "content": prompt})
+    # Sohbet geçmişini backend'den çekelim
+    # Bu kısmı st.session_state içinde tutarak her rerun'da tekrar çekmemeyi optimize edebiliriz.
+    if "chat_history_from_backend" not in st.session_state or st.session_state.get("last_history_chatbot_id") != chatbot_id:
+        try:
+            history_response = requests.get(f"{BASE_URL}/chatbots/{chatbot_id}/history/") # <-- Düzeltme: BASE_URL kullanıldı
+            history_response.raise_for_status()
+            st.session_state.chat_history_from_backend = history_response.json().get("history", [])
+            st.session_state.last_history_chatbot_id = chatbot_id # Hangi chatbot'un geçmişini yüklediğimizi takip et
+        except requests.exceptions.RequestException as e:
+            st.error(f"Sohbet geçmişi yüklenirken hata oluştu: {e}")
+            st.session_state.chat_history_from_backend = []
+
+    # Streamlit'in sohbet arayüzü
+    # Mesajları göster
+    for message in st.session_state.chat_history_from_backend:
+        if message["sender"] == "user":
+            with st.chat_message("user"):
+                st.markdown(message["message"])
+        else:
+            with st.chat_message("assistant"):
+                st.markdown(message["message"])
+
+    # Kullanıcıdan girdi al
+    if prompt := st.chat_input("Mesajınızı yazın..."):
+        # Kullanıcının mesajını UI'a ekle
         with st.chat_message("user"):
             st.markdown(prompt)
-
-        with st.chat_message("assistant"):
+        
+        # Backend'e sorguyu gönder
+        try:
             with st.spinner("Yanıt oluşturuluyor..."):
-                try:
-                    chat_request = {"query": prompt}
-                    response = requests.post(f"{BASE_URL}/chatbots/{chatbot_id}/chat/", json=chat_request)
-                    response.raise_for_status()
-                    assistant_response = response.json()["answer"]
-                    st.markdown(assistant_response)
-                    st.session_state.chat_history[chatbot_id].append({"role": "assistant", "content": assistant_response})
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Chatbot'tan yanıt alınırken hata oluştu: {e}")
-                    st.session_state.chat_history[chatbot_id].append({"role": "assistant", "content": f"Hata: {e}"})
+                chat_response = requests.post(f"{BASE_URL}/chatbots/{chatbot_id}/chat/", json={"query": prompt}) # <-- Düzeltme: BASE_URL kullanıldı
+                chat_response.raise_for_status()
+                answer = chat_response.json()["answer"]
+            
+            # Botun yanıtını UI'a ekle
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+            
+            # Geçmişi güncelle ve UI'ı yeniden çiz (Frontend cache'ini güncelledik)
+            st.session_state.chat_history_from_backend.append({"sender": "user", "message": prompt})
+            st.session_state.chat_history_from_backend.append({"sender": "bot", "message": answer})
+            
+            st.rerun() # Yeni mesajları ve güncel geçmişi göstermek için
+        except requests.exceptions.RequestException as e:
+            st.error(f"Sohbet sırasında bir hata oluştu: {e}")
+            # Hata durumunda da UI'ı yenileyebiliriz, belki bir uyarı mesajı göstermek için
+            st.rerun()
 
 
 def display_chatbot_documents_and_upload():
@@ -301,7 +337,7 @@ def display_chatbot_documents_and_upload():
 
     # Mevcut dokümanları listele
     try:
-        response = requests.get(f"{BASE_URL}/chatbots/{chatbot_id}/documents/")
+        response = requests.get(f"{BASE_URL}/chatbots/{chatbot_id}/documents/") # <-- Düzeltme: BASE_URL kullanıldı
         response.raise_for_status()
         documents = response.json()
 
@@ -309,20 +345,7 @@ def display_chatbot_documents_and_upload():
             st.write("Mevcut Yüklü Dokümanlar:")
             for doc_info in documents:
                 filename = doc_info['filename']
-                # Eğer tek bir dokümanı silme endpoint'ini kullanıyorsak
-                # burada her bir dosya için bir silme butonu koyabiliriz.
-                # Ancak FAISS indeksi yeniden oluşturma mantığı karmaşık olduğu için,
-                # şimdilik sadece listeliyoruz.
-                # Eğer tek tek doküman silmeyi aktif ederseniz, FAISS indeksini manuel
-                # yeniden oluşturmanız veya kullanıcının komple chatbot'u silip yeniden yüklemesini
-                # sağlamanız gerekebilir.
                 st.markdown(f"- **{filename}** (Sayfalar: {', '.join(map(str, doc_info['pages']))})")
-                # Basit silme butonu örneği (backend'deki tek doküman silme endpoint'i aktifse)
-                # if st.button(f"Sil {filename}", key=f"delete_doc_{chatbot_id}_{filename}"):
-                #     # Bu kısmı aktif ederseniz, document_id'leri de yönetmeniz gerekir.
-                #     # backend'deki document_id listesinden birini seçip göndermeniz gerekir.
-                #     # requests.delete(f"{BASE_URL}/chatbots/{chatbot_id}/documents/{doc_info['document_ids'][0]}")
-                #     st.warning("Tek tek doküman silme özelliği FAISS indeksi yönetimi nedeniyle daha karmaşıktır.")
         else:
             st.info("Bu chatbot için henüz yüklenmiş bir doküman bulunmamaktadır.")
 
@@ -334,10 +357,10 @@ def display_chatbot_documents_and_upload():
     st.subheader("Yeni Doküman Yükle")
     with st.form(key=f"upload_doc_form_{chatbot_id}", clear_on_submit=True):
         uploaded_files = st.file_uploader("Yüklenecek Dokümanlar (PDF, TXT, DOCX)", 
-                                           type=["pdf", "txt", "docx"], 
-                                           accept_multiple_files=True,
-                                           key=f"uploader_{chatbot_id}",
-                                           help="Bu chatbot'un bilgi tabanını genişletecek belgeler.")
+                                             type=["pdf", "txt", "docx"], 
+                                             accept_multiple_files=True,
+                                             key=f"uploader_{chatbot_id}",
+                                             help="Bu chatbot'un bilgi tabanını genişletecek belgeler.")
         submit_upload = st.form_submit_button("Dokümanları Yükle")
 
         if submit_upload and uploaded_files:
@@ -348,7 +371,7 @@ def display_chatbot_documents_and_upload():
                 try:
                     files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
                     upload_response = requests.post(
-                        f"{BASE_URL}/chatbots/{chatbot_id}/upload_document/", 
+                        f"{BASE_URL}/chatbots/{chatbot_id}/upload_document/", # <-- Düzeltme: BASE_URL kullanıldı
                         files=files
                     )
                     upload_response.raise_for_status()
@@ -372,6 +395,10 @@ def reset_chat_selection():
     st.session_state.show_create_bot_form = False
     st.session_state.show_edit_bot_form = False # Yeni: Düzenleme formunu da kapat
     st.cache_data.clear()
+    
+    # Sohbet geçmişini de silin
+    if "chat_history_from_backend" in st.session_state:
+        del st.session_state.chat_history_from_backend
     st.rerun()
 
 # Sol kenar çubuğu (sidebar)
@@ -390,7 +417,7 @@ with st.sidebar:
 # Ana içerik alanı
 if st.session_state.current_chatbot_id:
     # Bir chatbot seçiliyse sohbet arayüzünü göster
-    display_chat_interface()
+    display_chatbot_chat_interface()
     # Sohbet arayüzünün altında doküman yönetimini de göster
     st.markdown("---") # Ayırıcı
     display_chatbot_documents_and_upload()

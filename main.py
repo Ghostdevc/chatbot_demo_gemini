@@ -637,6 +637,10 @@ async def list_chatbot_documents(chatbot_id: int):
 class ChatRequest(BaseModel):
     query: str
 
+
+# Selamlama kalıplarını belirleyelim
+GREETING_PATTERNS = ["merhaba", "selam", "günaydın", "iyi günler", "iyi akşamlar", "iyi geceler", "nasılsın", "naber"]
+
 @app.post("/chatbots/{chatbot_id}/chat/")
 async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
     """
@@ -690,8 +694,19 @@ async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
             role = "user" if isinstance(msg, HumanMessage) else "assistant"
             messages_for_guardrails.append({"role": role, "content": msg.content})
 
-        # Bağlamı (ilgili dokümanlar) bir kullanıcı mesajı olarak ekle (eğer varsa)
-        if context_str:
+        # Kullanıcının mevcut sorusunu küçük harfe çevirerek selamlama tespiti yapalım
+        user_query_lower = request.query.lower().strip()
+
+        # Eğer kullanıcının sorgusu bir selamlama ise, bağlamı eklemeyelim
+        # Daha sofistike bir selamlama tespiti için burası geliştirilebilir.
+        is_greeting = False
+        for pattern in GREETING_PATTERNS:
+            if pattern in user_query_lower:
+                is_greeting = True
+                break
+        
+        # Bağlamı (ilgili dokümanlar) bir kullanıcı mesajı olarak ekle (eğer varsa VE bir selamlama DEĞİLSE)
+        if context_str and not is_greeting:
             messages_for_guardrails.append({"role": "user", "content": f"İşte kullanabileceğin bilgiler:\n<documents>\n{context_str}\n</documents>"})
         
         # Kullanıcının mevcut sorusunu ekle
@@ -718,19 +733,13 @@ async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
                     json_content_str = raw_llm_output_str
                 
                 try:
-                    # Buraya kadar her şey doğru çalışıyor, çıktı bir Python dict'i.
-                    # Ancak çıktı, doğrudan {'response': ...} değil, 
-                    # {'therapist_response_schema': {'response': ..., ...}} şeklinde.
                     parsed_json_output = json.loads(json_content_str)
                     print(f"DEBUG: LLM'den gelen ham çıktı başarıyla JSON'a dönüştürüldü.")
                     
-                    # ***** DEĞİŞİKLİK BURADA *****
-                    # 'therapist_response_schema' anahtarının altındaki sözlüğe erişiyoruz.
                     if "therapist_response_schema" in parsed_json_output and \
                     isinstance(parsed_json_output["therapist_response_schema"], dict):
                         response_data_from_guardrails = parsed_json_output["therapist_response_schema"]
                     else:
-                        # Eğer beklenmeyen bir durum olursa, yine de loglayıp hata fırlatalım
                         print(f"HATA: 'therapist_response_schema' anahtarı bulunamadı veya dict değil. İçerik: {parsed_json_output}")
                         raise ValueError("Guardrails çıktısı beklenmeyen bir yapıya sahip.")
 
@@ -746,19 +755,15 @@ async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
                 print(f"HATA: 'raw_llm_output' özelliği bulunamadı veya string değil. Tip: {type(validated_output)}, İçerik: {validated_output}")
                 raise ValueError("Guardrails'tan beklenen ham LLM çıktısı alınamadı.")
 
-            # Eğer response_data_from_guardrails hala None ise veya bir dict değilse, hata fırlatalım
-            # Bu kontrol, 'therapist_response_schema' erişimi sonrası yapılmalı.
             if not isinstance(response_data_from_guardrails, dict) or "response" not in response_data_from_guardrails:
                 print(f"HATA: Nihai response_data_from_guardrails bir dict değil veya 'response' anahtarı eksik. Tip: {type(response_data_from_guardrails)}, İçerik: {response_data_from_guardrails}")
                 raise ValueError("Guardrails'tan beklenen nihai yanıt formatı uygun değil.")
 
 
-            # JSON objesinden değerleri al - ARTIK DOĞRU SÖZLÜĞE SAHİBİZ
             therapist_response = response_data_from_guardrails.get("response")
             sentiment_score = response_data_from_guardrails.get("sentiment_score")
             safety_flag = response_data_from_guardrails.get("safety_flag")
 
-            # ... (Sohbet geçmişini veritabanına kaydetme ve JSONResponse döndürme kısmı aynı kalır) ...
             save_chat_message_to_db(chatbot_id, "user", request.query)
             save_chat_message_to_db(chatbot_id, "bot", therapist_response)
 

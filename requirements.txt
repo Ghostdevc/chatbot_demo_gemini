@@ -15,3 +15,4 @@ python-multipart
 python-docx # Word belgeleri (.docx) için
 unstructured # Geniş dosya türleri desteği için (isteğe bağlı ama güçlü)
 ebooklib # EPUB dosyaları için (isteğe bağlı)
+guardrails-ai

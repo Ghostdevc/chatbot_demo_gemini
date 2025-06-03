@@ -2,6 +2,8 @@
 import os
 from dotenv import load_dotenv
 
+import json
+
 from fastapi import FastAPI, Response, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -27,8 +29,14 @@ from langchain.prompts import PromptTemplate # Eğer PromptTemplate kullanıyors
 
 from langchain.memory import ConversationBufferWindowMemory # Önceki N mesajı tutmak için
 from langchain.chains import ConversationalRetrievalChain
-from langchain.schema import HumanMessage, AIMessage # Sohbet geçmişini temsil etmek için
+from langchain.schema import HumanMessage, AIMessage, BaseMessage # Sohbet geçmişini temsil etmek için
 from typing import List, Dict, Any # Tip belirtmeleri için
+
+
+# Guardrails
+from guardrails import Guard
+# Özel doğrulayıcıları import edin
+from validators import IsNotMedicalAdvice, IsNotHarmful, IsEmpatheticAndSupportive, IsNotOverlyLong, IsNotLegalFinancialAdvice 
 
 
 
@@ -48,6 +56,42 @@ FAISS_INDEX_PATH = "faiss_index.bin" # FAISS indeksini diske kaydedeceğimiz yer
 
 # --- FastAPI Uygulaması ve Global Değişkenler ---
 app = FastAPI()
+
+
+try:
+    guard_therapist = Guard.for_rail("therapist_bot.rail")
+    print("Guardrails terapist botu için RAIL dosyası başarıyla yüklendi.")
+except Exception as e:
+    print(f"Hata: Guardrails RAIL dosyası yüklenirken sorun oluştu: {e}")
+    # Uygulamanın başlatılmasını engellemek için bir hata fırlatabilir veya varsayılan davranışa dönebilirsiniz.
+    raise e # Eğer hata olursa uygulamanın başlamasını istemiyorsanız bunu açabilirsiniz.
+
+
+# Guardrails için LLM çağrısını saran yardımcı fonksiyon
+def call_llm_with_guardrails(llm_model: ChatGoogleGenerativeAI, messages: List[Dict[str, str]], **kwargs) -> str:
+    langchain_messages: List[BaseMessage] = []
+    for msg_dict in messages:
+        if msg_dict["role"] == "user":
+            langchain_messages.append(HumanMessage(content=msg_dict["content"]))
+        elif msg_dict["role"] == "assistant":
+            langchain_messages.append(AIMessage(content=msg_dict["content"]))
+        # Diğer roller (system vs.) varsa buraya eklenebilir.
+
+    # Guardrails'tan gelen ancak llm_model.invoke() tarafından desteklenmeyen argümanları filtrele.
+    # Genellikle bu, LLM modelinin başlangıçta ayarlanması gereken parametrelerdir.
+    # LLM modeli oluşturulurken zaten temperature=0.7 ayarlanmıştır.
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k not in ["temperature", "max_tokens", "top_p", "top_k"]}
+    # 'temperature' gibi parametreler, Guardrails'ın dahili olarak RAIL dosyasından veya 
+    # varsayılan olarak LLM'e geçirmeye çalıştığı ancak LangChain modelinin invoke metodunun kabul etmediği parametrelerdir.
+    # Buraya modelinizin invoke metodunun kabul etmediği diğer tüm parametreleri ekleyebilirsiniz.
+
+    # LLM'i dönüştürülmüş mesajlarla ve filtrelenmiş kwargs ile çağır
+    ai_message_response = llm_model.invoke(langchain_messages, **filtered_kwargs)
+    
+    # LLM'den gelen AI yanıtının content'ini döndür
+    return ai_message_response.content
+
+
 
 # Google Generative AI Embeddings modelini başlatın
 # models/embedding-001 modeli 768 boyutlu vektörler üretir.
@@ -597,7 +641,7 @@ class ChatRequest(BaseModel):
 async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
     """
     Belirli bir chatbot'a göre kullanıcı sorularını yanıtlar.
-    Konuşma geçmişini yönetir.
+    Konuşma geçmişini yönetir ve Guardrails ile çıktıyı doğrular.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -610,101 +654,163 @@ async def chat_with_chatbot(chatbot_id: int, request: ChatRequest):
 
         current_faiss_index = load_or_create_faiss_index(chatbot_id)
 
+        context_str = ""
         if current_faiss_index is None or (hasattr(current_faiss_index.index, 'ntotal') and current_faiss_index.index.ntotal == 0):
-            raise HTTPException(status_code=404, detail=f"'{chatbot_name}' için henüz taranmış bir belge bulunmuyor. Lütfen önce belge ekleyin.")
+            print(f"Uyarı: '{chatbot_name}' için henüz taranmış bir belge bulunmuyor. Genel bilgi ile devam ediliyor.")
+        else:
+            # Kullanıcının sorgusuyla ilgili dokümanları çek
+            # LangChainDeprecationWarning'i çözmek için .invoke() kullanıyoruz.
+            docs = await current_faiss_index.as_retriever().ainvoke(request.query)
+            context_str = "\n".join([doc.page_content for doc in docs])
 
-        # Sohbet geçmişini veritabanından yükle
+
         loaded_chat_history_messages = load_chat_history_from_db(chatbot_id)
 
-        # LangChain belleği oluştur (son N mesajı tutmak için)
-        # Burada pencere boyutu 5 olarak ayarlanmıştır, yani son 5 soru-cevap çifti hatırlanır.
-        # Bunu ihtiyacınıza göre artırıp azaltabilirsiniz. Daha büyük pencere, daha fazla token maliyeti demek.
+        # LangChain memory nesnesini oluştur (Bu deprecation uyarısı devam edebilir, LangChain'in iç yapısıyla ilgili)
         memory = ConversationBufferWindowMemory(
             memory_key="chat_history", 
             return_messages=True, 
             output_key='answer',
-            k=5 # Son 5 etkileşimi (soru-cevap çifti) hatırla
+            k=5 
         )
-        # Yüklenen geçmişi belleğe ekle
+        # Geçmiş mesajları memory'ye ekle
         for msg in loaded_chat_history_messages:
             if isinstance(msg, HumanMessage):
                 memory.chat_memory.add_user_message(msg.content)
             elif isinstance(msg, AIMessage):
                 memory.chat_memory.add_ai_message(msg.content)
 
-        # LLM modelini kullan (model adını kendi listenizdeki çalışan bir modelle güncellediğinizden emin olun)
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-preview-05-20", temperature=0.7, google_api_key=GOOGLE_API_KEY)
 
-        # Prompt metnini burada tanımlıyoruz
-        PROMPT_WITH_HISTORY_TEMPLATE = f"""
-            Sen, '{chatbot_name}' adlı bir yapay zeka asistanısın. Kullanıcılarla doğal, arkadaş canlısı ve yardımcı bir tonda sohbet ediyorsun. Sana sunulan tüm bilgiyi, sanki senin kendi doğal bilginmiş gibi doğrudan ifade et; asla bir "kaynak", "belge", "bilgi" veya "sağlanan veri"ye atıfta bulunma.
+        # Guardrails için mesaj listesini oluştur
+        messages_for_guardrails: List[Dict[str, str]] = []
 
-            Amacın, öncelikle sana sunulan bilgilerle ilgili soruları yanıtlamak. Ancak, eğer soru doğrudan bu bilgilerle ilgili değilse veya genel bir selamlama/kibarlık ifadesiyse, genel bilginle uygun ve dostça bir yanıt ver.
+        # Geçmişteki konuşmaları mesaj listesine ekle
+        for msg in memory.chat_memory.messages:
+            role = "user" if isinstance(msg, HumanMessage) else "assistant"
+            messages_for_guardrails.append({"role": role, "content": msg.content})
 
-            Sorulara yanıt verirken, sadece sana verilen bilgilerle yetin. Eğer bir soruya verilen bilgiler arasında yanıt bulunmuyorsa, bu konuda bilgiye sahip olmadığını veya yardımcı olamayacağını açıkça ve nazikçe ifade et. Ardından, kullanıcıya istersen farklı bir soru sorabileceğini veya başka bir konuda yardımcı olabileceğini kibarca belirt. Asla yanlış veya uydurma bilgi verme.
+        # Bağlamı (ilgili dokümanlar) bir kullanıcı mesajı olarak ekle (eğer varsa)
+        if context_str:
+            messages_for_guardrails.append({"role": "user", "content": f"İşte kullanabileceğin bilgiler:\n<documents>\n{context_str}\n</documents>"})
+        
+        # Kullanıcının mevcut sorusunu ekle
+        messages_for_guardrails.append({"role": "user", "content": request.query})
 
-            Sohbete insan gibi bir başlangıç yapabilir veya genel sorulara (merhaba, nasılsın gibi) uygun bir karşılık verebilirsin. Cevapların kısa ve öz olabilir, ancak doğal bir dil kullan.
 
-            **KESİNLİKLE UYMAN GEREKEN KURALLAR:**
-            - Cevaplarını kibar, saygılı ve yardımsever bir tonda tut.
-            - Sana sunulan bilgileri, kendi bilginmiş gibi doğal bir dille sun.
-            - **Asla "belgelerde", "kaynaklarda", "bağlamda", "elimizde", "bana sağlanan bilgilerde", "bilgilere göre", "anladığım kadarıyla", "belirtiliyor" gibi ifadelere yer verme.** Bu kelimeleri veya benzer anlamdaki kelimeleri kullanmaktan kaçın.
-            - Eğer sana verilen bilgiler dışı genel bir soru gelirse, genel bilgiyle cevapla.
-            - Eğer soru uygunsuz veya alakasız ise, konuya uygun bir şekilde geri çevir.
-            - Kişisel bilgi isteme veya verme.
-
-            {boundary_text if boundary_text else ""}
-
-            Sohbet geçmişi (önceki konuşmalar):
-            {{chat_history}}
-
-            İşte kullanabileceğin bilgiler:
-            <documents>
-            {{context}}
-            </documents>
-
-            Kullanıcının sorusu: {{question}}
-
-            Yanıtın:
-            """
+        # Guardrails'ı kullanarak LLM'den yanıt al
+        try:
+            validated_output = guard_therapist(
+                call_llm_with_guardrails, 
+                llm_model=llm,            
+                messages=messages_for_guardrails, 
+                num_reasks=2              
+            )
             
-        # prompt_template nesnesini oluştur
-        prompt_template = PromptTemplate(
-            template=PROMPT_WITH_HISTORY_TEMPLATE,
-            input_variables=["chat_history", "context", "question"]
-        )
+            response_data_from_guardrails = None
 
-        # ConversationalRetrievalChain oluştur
-        # Bu zincir hem retriever'ı (FAISS) hem de belleği (chat history) kullanır
-        qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=current_faiss_index.as_retriever(),
-            memory=memory,
-            combine_docs_chain_kwargs={"prompt": prompt_template}, # Yeni prompt template'imizi buraya veriyoruz
-            return_source_documents=False # Kaynak dokümanları döndürmeyelim şimdilik
-        )
+            if hasattr(validated_output, 'raw_llm_output') and isinstance(validated_output.raw_llm_output, str):
+                raw_llm_output_str = validated_output.raw_llm_output
+                
+                if raw_llm_output_str.startswith("```json") and raw_llm_output_str.endswith("```"):
+                    json_content_str = raw_llm_output_str[len("```json\n"):-len("\n```")]
+                else:
+                    json_content_str = raw_llm_output_str
+                
+                try:
+                    # Buraya kadar her şey doğru çalışıyor, çıktı bir Python dict'i.
+                    # Ancak çıktı, doğrudan {'response': ...} değil, 
+                    # {'therapist_response_schema': {'response': ..., ...}} şeklinde.
+                    parsed_json_output = json.loads(json_content_str)
+                    print(f"DEBUG: LLM'den gelen ham çıktı başarıyla JSON'a dönüştürüldü.")
+                    
+                    # ***** DEĞİŞİKLİK BURADA *****
+                    # 'therapist_response_schema' anahtarının altındaki sözlüğe erişiyoruz.
+                    if "therapist_response_schema" in parsed_json_output and \
+                    isinstance(parsed_json_output["therapist_response_schema"], dict):
+                        response_data_from_guardrails = parsed_json_output["therapist_response_schema"]
+                    else:
+                        # Eğer beklenmeyen bir durum olursa, yine de loglayıp hata fırlatalım
+                        print(f"HATA: 'therapist_response_schema' anahtarı bulunamadı veya dict değil. İçerik: {parsed_json_output}")
+                        raise ValueError("Guardrails çıktısı beklenmeyen bir yapıya sahip.")
 
-        # Chain'i çalıştır ve yanıtı al
-        response = qa_chain.invoke({"question": request.query})
-        answer = response["answer"]
+                except json.JSONDecodeError as e:
+                    print(f"HATA: Ayıklanan string JSON'a dönüştürülemedi. Hata: {e}")
+                    print(f"Ayıklanmaya çalışılan string: \n{json_content_str}")
+                    raise ValueError(f"LLM'den gelen yanıt JSON formatında değil: {e}")
+                except Exception as inner_e:
+                    print(f"HATA: Guardrails çıktısı işlenirken beklenmedik bir hata oluştu: {inner_e}")
+                    raise ValueError("Guardrails çıktısı işlenirken hata oluştu.")
+            
+            else:
+                print(f"HATA: 'raw_llm_output' özelliği bulunamadı veya string değil. Tip: {type(validated_output)}, İçerik: {validated_output}")
+                raise ValueError("Guardrails'tan beklenen ham LLM çıktısı alınamadı.")
 
-        # Sohbet geçmişini veritabanına kaydet (kullanıcı sorusu ve bot cevabı)
-        save_chat_message_to_db(chatbot_id, "user", request.query)
-        save_chat_message_to_db(chatbot_id, "bot", answer)
+            # Eğer response_data_from_guardrails hala None ise veya bir dict değilse, hata fırlatalım
+            # Bu kontrol, 'therapist_response_schema' erişimi sonrası yapılmalı.
+            if not isinstance(response_data_from_guardrails, dict) or "response" not in response_data_from_guardrails:
+                print(f"HATA: Nihai response_data_from_guardrails bir dict değil veya 'response' anahtarı eksik. Tip: {type(response_data_from_guardrails)}, İçerik: {response_data_from_guardrails}")
+                raise ValueError("Guardrails'tan beklenen nihai yanıt formatı uygun değil.")
 
-        return JSONResponse(
-            status_code=200,
-            content={"answer": answer}
-        )
+
+            # JSON objesinden değerleri al - ARTIK DOĞRU SÖZLÜĞE SAHİBİZ
+            therapist_response = response_data_from_guardrails.get("response")
+            sentiment_score = response_data_from_guardrails.get("sentiment_score")
+            safety_flag = response_data_from_guardrails.get("safety_flag")
+
+            # ... (Sohbet geçmişini veritabanına kaydetme ve JSONResponse döndürme kısmı aynı kalır) ...
+            save_chat_message_to_db(chatbot_id, "user", request.query)
+            save_chat_message_to_db(chatbot_id, "bot", therapist_response)
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "answer": therapist_response,
+                    "sentiment_score": sentiment_score,
+                    "safety_flag": safety_flag
+                }
+            )
+
+        except Exception as guardrails_or_llm_e:
+            print(f"Guardrails veya LLM işleme hatası: {guardrails_or_llm_e}")
+            
+            error_message = "Üzgünüm, şu anda yanıtımı oluştururken bir sorun oluştu. Profesyonel bir destek almak isterseniz, lütfen bir uzmana danışın."
+            
+            # Guardrails'tan gelen özel hata mesajlarını yakala ve daha spesifik yanıtlar ver
+            if "Validation failed for field" in str(guardrails_or_llm_e):
+                error_message = f"Yanıt formatı veya içerik doğrulaması başarısız oldu. Lütfen tekrar deneyin. Detay: {str(guardrails_or_llm_e)}"
+            elif "NotFound: 404 models" in str(guardrails_or_llm_e):
+                error_message = "Chatbot modeline erişimde bir sorun var. Lütfen daha sonra tekrar deneyin."
+            elif "Invalid request" in str(guardrails_or_llm_e) or "Please ensure that your inputs are in the expected format" in str(guardrails_or_llm_e):
+                error_message = "Modelin yanıtı işlenirken bir problem oluştu (geçersiz istek formatı). Lütfen farklı bir şekilde ifade etmeyi deneyin."
+            elif "is-not-medical-advice" in str(guardrails_or_llm_e):
+                error_message = "Üzgünüm, tıbbi tavsiye veremem. Bu tür konularda profesyonel bir uzmana danışmalısınız."
+            elif "is-not-harmful" in str(guardrails_or_llm_e):
+                error_message = "Güvenliğiniz benim için çok önemli. Lütfen bir kriz hattına veya uzmana başvurun."
+            elif "is-not-legal-financial-advice" in str(guardrails_or_llm_e):
+                error_message = "Hukuki veya finansal konularda tavsiye veremem. Lütfen ilgili alanda bir profesyonele danışın."
+            elif "is-not-overly-long" in str(guardrails_or_llm_e):
+                error_message = "Yanıtım çok uzun olamaz. Lütfen sorunuzu daha kısa tutmaya çalışın veya daha genel bir soru sorun."
+            elif "is-empathetic-and-supportive" in str(guardrails_or_llm_e):
+                error_message = "Yanıtım yeterince empatik değildi. Üzgünüm, daha iyi olacağım. Lütfen kendinizi nasıl hissettiğinizi tekrar ifade edin."
+
+
+            return JSONResponse(
+                status_code=500,
+                content={"answer": error_message, "error_details": str(guardrails_or_llm_e)}
+            )
 
     except HTTPException as e:
+        # FastAPI'nin kendi HTTP hatalarını doğrudan ilet
         raise e
     except Exception as e:
-        print(f"Chatbot sohbet hatası: {e}")
-        raise HTTPException(status_code=500, detail=f"Soru işlenirken bir hata oluştu: {e}")
+        print(f"Genel chatbot sohbet hatası (dış blok): {e}")
+        # Diğer genel hatalar için yakalama
+        raise HTTPException(status_code=500, detail=f"Soru işlenirken beklenmeyen bir hata oluştu: {e}. Güvenliğiniz benim için önemli.")
     finally:
         cursor.close()
         conn.close()
+
     
 
 # --- Yeni Chatbot Yönetim Endpoints'leri ---

@@ -308,19 +308,41 @@ def display_chatbot_chat_interface():
         # Backend'e sorguyu gönder
         try:
             with st.spinner("Yanıt oluşturuluyor..."):
-                chat_response = requests.post(f"{BASE_URL}/chatbots/{chatbot_id}/chat/", json={"query": prompt}) # <-- Düzeltme: BASE_URL kullanıldı
-                chat_response.raise_for_status()
-                answer = chat_response.json()["answer"]
-            
-            # Botun yanıtını UI'a ekle
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-            
-            # Geçmişi güncelle ve UI'ı yeniden çiz (Frontend cache'ini güncelledik)
-            st.session_state.chat_history_from_backend.append({"sender": "user", "message": prompt})
-            st.session_state.chat_history_from_backend.append({"sender": "bot", "message": answer})
-            
-            st.rerun() # Yeni mesajları ve güncel geçmişi göstermek için
+                try:
+                    chat_response = requests.post(f"{BASE_URL}/chatbots/{chatbot_id}/chat/", json={"query": prompt})
+                    chat_response.raise_for_status()
+                    
+                    # Backend'den gelen tüm yanıtı al
+                    response_data = chat_response.json()
+                    assistant_response = response_data.get("answer", "Yanıt alınamadı.")
+                    sentiment_score = response_data.get("sentiment_score")
+                    safety_flag = response_data.get("safety_flag")
+
+                    with st.chat_message("assistant"):
+                        st.markdown(assistant_response)
+                        # İsteğe bağlı olarak ek bilgileri gösterebiliriz (debugging veya kullanıcıya bilgi vermek için)
+                        if sentiment_score is not None:
+                            st.caption(f"Duygu Puanı: {sentiment_score}")
+                        if safety_flag:
+                            st.caption(f"Güvenlik Kontrolü: {safety_flag}")
+
+                    st.session_state.chat_history_from_backend.append({"sender": "user", "message": prompt})
+                    st.session_state.chat_history_from_backend.append({"sender": "bot", "message": assistant_response})
+                    
+                    st.rerun() 
+                except requests.exceptions.RequestException as e:
+                    error_detail = "Bilinmeyen bir hata oluştu."
+                    if e.response and e.response.status_code == 500:
+                        try:
+                            error_json = e.response.json()
+                            error_detail = error_json.get("answer", error_json.get("detail", error_detail))
+                        except ValueError: # JSON decode error
+                            error_detail = e.response.text
+                    
+                    st.error(f"Sohbet sırasında bir hata oluştu: {error_detail}")
+                    # Hata durumunda da UI'ı yenileyebiliriz, belki bir uyarı mesajı göstermek için
+                    st.session_state.chat_history_from_backend.append({"sender": "bot", "message": f"Hata: {error_detail}"})
+                    st.rerun()
         except requests.exceptions.RequestException as e:
             st.error(f"Sohbet sırasında bir hata oluştu: {e}")
             # Hata durumunda da UI'ı yenileyebiliriz, belki bir uyarı mesajı göstermek için
